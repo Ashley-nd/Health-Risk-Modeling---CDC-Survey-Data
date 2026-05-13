@@ -1,0 +1,464 @@
+---
+title: "Health risk project"
+output: "word_document"
+date: "2026-04-27"
+
+
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+---
+title: "Health Risk Modeling — CDC Survey Data"
+author: "Ashley & John"
+date: "2026-04-07"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(haven)
+brfss_raw <- read_xpt("path_to_my _one_drive_dataset")
+```
+
+```{r}
+dim(brfss_raw)
+head(brfss_raw)
+```
+
+#Lets explore the data
+
+```{r}
+
+# 0. Packages
+############################
+library(haven)
+library(dplyr)
+library(ggplot2)
+library(glmnet)
+library(nnet)
+library(randomForest)
+library(caret)
+
+# Inspect
+dim(brfss_raw)
+head(brfss_raw)
+str(brfss_raw)
+
+############################
+# 2. Basic Exploration
+############################
+# Example variable checks
+table(brfss_raw$CVDINFR4, useNA = "ifany")
+table(brfss_raw$CVDCRHD4, useNA = "ifany")
+table(brfss_raw$PHYSHLTH, useNA = "ifany")
+
+# Histogram of physical health days
+ggplot(brfss_raw, aes(x = PHYSHLTH)) +
+  geom_histogram(binwidth = 1, fill = "steelblue") +
+  theme_minimal() +
+  ggtitle("Distribution of Physical Health Days")
+```
+
+```{r}
+# 3. Clean Special Codes
+
+# Helper function for BRFSS missing codes
+clean_brfss <- function(x) {
+  x[x %in% c(7, 9, 77, 88, 99, 777, 888, 999)] <- NA
+  return(x)
+}
+
+brfss <- brfss_raw
+
+# Clean variables of interest
+vars_to_clean <- c(
+  "PHYSHLTH", "MENTHLTH", "GENHLTH", "EXERANY2",
+  "MEDCOST1", "CHECKUP1", "CVDINFR4", "CVDCRHD4",
+  "SEXVAR", "_BMI5"
+)
+
+for (v in vars_to_clean) {
+  if (v %in% names(brfss)) {
+    brfss[[v]] <- clean_brfss(brfss[[v]])
+  }
+}
+```
+
+```{r}
+
+# 4. Create Targets
+
+# 4A. Classification target: heart disease
+# 1 if heart attack OR coronary heart disease, 0 if both explicitly "No"
+brfss <- brfss %>%
+  mutate(
+    heart_disease = case_when(
+      CVDINFR4 == 1 | CVDCRHD4 == 1 ~ 1,
+      CVDINFR4 == 2 & CVDCRHD4 == 2 ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+table(brfss$heart_disease, useNA = "ifany")
+
+# 4B. Regression target: poor physical health days
+# Keep values 0 to 30 only
+brfss <- brfss %>%
+  mutate(
+    poor_health_days = ifelse(PHYSHLTH >= 0 & PHYSHLTH <= 30, PHYSHLTH, NA)
+  )
+
+summary(brfss$poor_health_days)
+
+```
+
+```{r}
+
+# 5. Non-response Indicators
+# Professor feedback: non-response may carry signal
+
+brfss <- brfss_raw %>%
+  mutate(
+    nonresp_PHYSHLTH = ifelse(PHYSHLTH %in% c(77, 88, 99), 1, 0),
+    nonresp_MENTHLTH = ifelse(MENTHLTH %in% c(77, 88, 99), 1, 0),
+    nonresp_GENHLTH  = ifelse(GENHLTH  %in% c(7, 9), 1, 0)
+  ) %>%
+  bind_cols(
+    brfss %>% select(heart_disease, poor_health_days)
+  )
+```
+
+```{r}
+
+# 6. Select Candidate Variables
+# Keep this manageable for project clarity
+candidate_vars <- c(
+  "heart_disease",
+  "poor_health_days",
+  "GENHLTH",
+  "PHYSHLTH",
+  "MENTHLTH",
+  "PRIMINS2",
+  "PERSDOC3",
+  "MEDCOST1",
+  "CHECKUP1",
+
+  "EXERANY2",
+  "SMOKE100",
+  "SMOKDAY2",
+  "ECIGNOW3",
+  "USENOW3",
+
+  "SEXVAR",
+  "_AGEG5YR",
+  "MARITAL",
+  "EDUCA",
+  "INCOME3",
+  "EMPLOY1",
+  "VETERAN3",
+  "RENTHOM1",
+
+  "_BMI5",
+
+  "DIABETE4",
+  "CVDSTRK3",
+  "CHCKDNY2",
+  "CHCCOPD3",
+  "ADDEPEV3",
+  "HAVARTH4",
+  "ASTHMA3",
+
+  "DEAF",
+  "BLIND",
+  "DECIDE",
+  "DIFFWALK",
+  "DIFFALON",
+
+  "LASTDEN4",
+  "HADSIGM4",
+  "COLNCNCR",
+
+  "nonresp_PHYSHLTH",
+  "nonresp_MENTHLTH",
+  "nonresp_GENHLTH"
+)
+
+candidate_vars <- candidate_vars[candidate_vars %in% names(brfss)]
+
+project_df <- brfss %>%
+  select(all_of(candidate_vars))
+```
+
+```{r}
+############################
+# 7. Classification Dataset
+############################
+class_df <- project_df %>%
+  filter(!is.na(heart_disease)) %>%
+  mutate(heart_disease = factor(heart_disease))
+
+# Remove rows with missing predictors for simple baseline version
+class_df_complete <- na.omit(class_df)
+
+dim(class_df_complete)
+table(class_df_complete$heart_disease)
+
+# Plot class imbalance
+ggplot(class_df_complete, aes(x = heart_disease)) +
+  geom_bar(fill = "tomato") +
+  theme_minimal() +
+  ggtitle("Heart Disease Distribution")
+```
+
+```{r}
+############################
+# 8. Train / Test / Calibration Split
+############################
+set.seed(730)
+
+idx <- sample(seq_len(nrow(class_df_complete)))
+class_df_complete <- class_df_complete[idx, ]
+
+n <- nrow(class_df_complete)
+n_train <- floor(0.6 * n)
+n_test  <- floor(0.2 * n)
+n_cal   <- n - n_train - n_test
+
+train_class <- class_df_complete[1:n_train, ]
+test_class  <- class_df_complete[(n_train + 1):(n_train + n_test), ]
+cal_class   <- class_df_complete[(n_train + n_test + 1):n, ]
+
+dim(train_class)
+dim(test_class)
+dim(cal_class)
+```
+
+```{r}
+############################
+# 9. LASSO Variable Selection for Classification
+############################
+x_train <- model.matrix(heart_disease ~ ., train_class)[, -1]
+y_train <- train_class$heart_disease
+
+cv_lasso_class <- cv.glmnet(
+  x_train,
+  y_train,
+  family = "binomial",
+  alpha = 1
+)
+
+plot(cv_lasso_class)
+
+lambda_1se_class <- cv_lasso_class$lambda.1se
+lambda_1se_class
+
+coef_class <- coef(cv_lasso_class, s = "lambda.1se")
+coef_class
+
+selected_class <- rownames(coef_class)[as.vector(coef_class != 0)]
+selected_class <- setdiff(selected_class, "(Intercept)")
+selected_class
+```
+
+```{r}
+############################
+# 10. Refit Logistic Regression
+############################
+if (length(selected_class) > 0) {
+  formula_class <- as.formula(
+    paste("heart_disease ~", paste(selected_class, collapse = " + "))
+  )
+
+  logit_model <- glm(
+    formula_class,
+    data = train_class,
+    family = binomial()
+  )
+
+  summary(logit_model)
+
+  # Odds ratios
+  odds_ratios <- exp(coef(logit_model))
+  odds_ratios
+
+  # Confidence intervals for odds ratios
+  # Uncomment if needed
+  # exp(confint(logit_model))
+}
+```
+
+```{r}
+############################
+# 11. Classification Performance
+############################
+test_probs <- predict(logit_model, newdata = test_class, type = "response")
+test_pred  <- ifelse(test_probs >= 0.5, 1, 0)
+test_pred  <- factor(test_pred, levels = c(0, 1))
+
+confusionMatrix(test_pred, test_class$heart_disease, positive = "1")
+
+############################
+# 12. Conformal Classification
+############################
+# Score-based conformal classification for binary case
+cal_probs <- predict(logit_model, newdata = cal_class, type = "response")
+
+# Nonconformity scores:
+# if true label = 1, score = 1 - p
+# if true label = 0, score = p
+cal_scores <- ifelse(
+  cal_class$heart_disease == 1,
+  1 - cal_probs,
+  cal_probs
+)
+
+alpha <- 0.05
+q_hat <- quantile(cal_scores, 1 - alpha, na.rm = TRUE)
+q_hat
+
+# Build prediction sets on test data
+test_probs_conf <- predict(logit_model, newdata = test_class, type = "response")
+
+prediction_sets <- lapply(test_probs_conf, function(p) {
+  include_1 <- (1 - p) <= q_hat
+  include_0 <- p <= q_hat
+
+  out <- c()
+  if (include_0) out <- c(out, 0)
+  if (include_1) out <- c(out, 1)
+  return(out)
+})
+
+# Coverage
+true_test <- as.numeric(as.character(test_class$heart_disease))
+coverage_class <- mean(
+  sapply(seq_along(prediction_sets), function(i) true_test[i] %in% prediction_sets[[i]])
+)
+coverage_class
+
+# Average set size
+avg_set_size_class <- mean(sapply(prediction_sets, length))
+avg_set_size_class
+```
+
+```{r}
+############################
+# 13. Regression Dataset
+############################
+reg_df <- project_df %>%
+  select(-heart_disease, -PHYSHLTH, -nonresp_PHYSHLTH) %>%
+  filter(!is.na(poor_health_days)) %>%
+  na.omit()
+
+dim(reg_df)
+summary(reg_df$poor_health_days)
+
+ggplot(reg_df, aes(x = poor_health_days)) +
+  geom_histogram(binwidth = 1, fill = "darkgreen") +
+  theme_minimal() +
+  ggtitle("Distribution of Poor Health Days")
+```
+
+```{r}
+############################
+# 14. Train / Test / Calibration Split for Regression
+############################
+set.seed(730)
+
+idx_reg <- sample(seq_len(nrow(reg_df)))
+reg_df <- reg_df[idx_reg, ]
+
+n_reg <- nrow(reg_df)
+n_train_reg <- floor(0.6 * n_reg)
+n_test_reg  <- floor(0.2 * n_reg)
+
+train_reg <- reg_df[1:n_train_reg, ]
+test_reg  <- reg_df[(n_train_reg + 1):(n_train_reg + n_test_reg), ]
+cal_reg   <- reg_df[(n_train_reg + n_test_reg + 1):n_reg, ]
+```
+
+```{r}
+############################
+# 15. LASSO for Regression
+############################
+x_train_reg <- model.matrix(poor_health_days ~ ., train_reg)[, -1]
+y_train_reg <- train_reg$poor_health_days
+
+cv_lasso_reg <- cv.glmnet(
+  x_train_reg,
+  y_train_reg,
+  family = "gaussian",
+  alpha = 1
+)
+
+plot(cv_lasso_reg)
+
+lambda_1se_reg <- cv_lasso_reg$lambda.1se
+lambda_1se_reg
+
+coef_reg <- coef(cv_lasso_reg, s = "lambda.1se")
+coef_reg
+
+selected_reg <- rownames(coef_reg)[as.vector(coef_reg != 0)]
+selected_reg <- setdiff(selected_reg, "(Intercept)")
+selected_reg
+
+############################
+# 16. Refit Linear Regression
+############################
+if (length(selected_reg) > 0) {
+  formula_reg <- as.formula(
+    paste("poor_health_days ~", paste(selected_reg, collapse = " + "))
+  )
+
+  lm_model <- lm(formula_reg, data = train_reg)
+  summary(lm_model)
+}
+```
+
+```{r}
+############################
+# 17. Conformal Regression
+############################
+# Absolute residual conformal regression
+cal_pred_reg <- predict(lm_model, newdata = cal_reg)
+cal_scores_reg <- abs(cal_reg$poor_health_days - cal_pred_reg)
+
+q_hat_reg <- quantile(cal_scores_reg, 1 - alpha, na.rm = TRUE)
+q_hat_reg
+
+test_pred_reg <- predict(lm_model, newdata = test_reg)
+
+lower <- test_pred_reg - q_hat_reg
+upper <- test_pred_reg + q_hat_reg
+
+# Coverage
+coverage_reg <- mean(
+  test_reg$poor_health_days >= lower & test_reg$poor_health_days <= upper
+)
+coverage_reg
+
+# Average interval width
+avg_width_reg <- mean(upper - lower)
+avg_width_reg
+```
+
+```{r}
+
+# 19. Simple Summary Outputs
+cat("\n===== CLASSIFICATION RESULTS =====\n")
+cat("Selected variables (LASSO):\n")
+print(selected_class)
+cat("\nConformal classification coverage:", coverage_class, "\n")
+cat("Average prediction set size:", avg_set_size_class, "\n")
+
+cat("\n===== REGRESSION RESULTS =====\n")
+cat("Selected variables (LASSO):\n")
+print(selected_reg)
+cat("\nConformal regression coverage:", coverage_reg, "\n")
+cat("Average interval width:", avg_width_reg, "\n")
